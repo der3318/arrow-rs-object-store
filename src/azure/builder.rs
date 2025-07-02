@@ -24,8 +24,12 @@ use crate::azure::{AzureCredential, AzureCredentialProvider, MicrosoftAzure, STO
 use crate::client::{http_connector, HttpConnector, TokenCredentialProvider};
 use crate::config::ConfigValue;
 use crate::{ClientConfigKey, ClientOptions, Result, RetryConfig, StaticCredentialProvider};
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 use percent_encoding::percent_decode_str;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::sync::Arc;
 use url::Url;
@@ -87,6 +91,16 @@ enum Error {
 
     #[error("Configuration key: '{}' is not known.", key)]
     UnknownConfigurationKey { key: String },
+
+    #[error(
+        "Invalid encryption header values. Header: {}, source: {}",
+        header,
+        source
+    )]
+    InvalidEncryptionHeader {
+        header: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 }
 
 impl From<Error> for crate::Error {
@@ -178,6 +192,8 @@ pub struct MicrosoftAzureBuilder {
     fabric_session_token: Option<String>,
     /// Fabric cluster identifier
     fabric_cluster_identifier: Option<String>,
+    /// Base64-encoded AES-256 encryption key
+    encryption_key_base64: Option<String>,
     /// The [`HttpConnector`] to use
     http_connector: Option<Arc<dyn HttpConnector>>,
 }
@@ -380,6 +396,13 @@ pub enum AzureConfigKey {
     /// - `fabric_cluster_identifier`
     FabricClusterIdentifier,
 
+    /// Base64-encoded AES-256 encryption key
+    ///
+    /// Supported keys:
+    /// - `azure_encryption_key_base64`
+    /// - `encryption_key_base64`
+    EncryptionKeyBase64,
+
     /// Client options
     Client(ClientConfigKey),
 }
@@ -410,6 +433,7 @@ impl AsRef<str> for AzureConfigKey {
             Self::FabricWorkloadHost => "azure_fabric_workload_host",
             Self::FabricSessionToken => "azure_fabric_session_token",
             Self::FabricClusterIdentifier => "azure_fabric_cluster_identifier",
+            Self::EncryptionKeyBase64 => "azure_encryption_key_base64",
             Self::Client(key) => key.as_ref(),
         }
     }
@@ -466,6 +490,7 @@ impl FromStr for AzureConfigKey {
             "azure_fabric_cluster_identifier" | "fabric_cluster_identifier" => {
                 Ok(Self::FabricClusterIdentifier)
             }
+            "azure_encryption_key_base64" | "encryption_key_base64" => Ok(Self::EncryptionKeyBase64),
             // Backwards compatibility
             "azure_allow_http" => Ok(Self::Client(ClientConfigKey::AllowHttp)),
             _ => match s.strip_prefix("azure_").unwrap_or(s).parse() {
@@ -594,6 +619,7 @@ impl MicrosoftAzureBuilder {
             AzureConfigKey::FabricClusterIdentifier => {
                 self.fabric_cluster_identifier = Some(value.into())
             }
+            AzureConfigKey::EncryptionKeyBase64 => self.encryption_key_base64 = Some(value.into()),
         };
         self
     }
@@ -635,6 +661,7 @@ impl MicrosoftAzureBuilder {
             AzureConfigKey::FabricWorkloadHost => self.fabric_workload_host.clone(),
             AzureConfigKey::FabricSessionToken => self.fabric_session_token.clone(),
             AzureConfigKey::FabricClusterIdentifier => self.fabric_cluster_identifier.clone(),
+            AzureConfigKey::EncryptionKeyBase64 => self.encryption_key_base64.clone(),
         }
     }
 
@@ -1034,6 +1061,47 @@ impl MicrosoftAzureBuilder {
             (false, url, credential, account_name)
         };
 
+        if let Some(key) = self.encryption_key_base64 {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-ms-encryption-algorithm",
+                HeaderValue::from_static("AES256"),
+            );
+
+            let mut header_value: HeaderValue =
+                key.clone()
+                    .try_into()
+                    .map_err(|err| Error::InvalidEncryptionHeader {
+                        header: "x-ms-encryption-key",
+                        source: Box::new(err),
+                    })?;
+            header_value.set_sensitive(true);
+            headers.insert("x-ms-encryption-key", header_value);
+
+            let decoded_key = BASE64_STANDARD.decode(key.as_bytes()).map_err(|err| {
+                Error::InvalidEncryptionHeader {
+                    header: "x-ms-encryption-key",
+                    source: Box::new(err),
+                }
+            })?;
+            let mut hasher = Sha256::new();
+            hasher.update(decoded_key);
+            let sha256 = BASE64_STANDARD.encode(hasher.finalize());
+            let mut sha256_header_value: HeaderValue =
+                sha256.try_into()
+                    .map_err(|err| Error::InvalidEncryptionHeader {
+                        header: "x-ms-encryption-key-sha256",
+                        source: Box::new(err),
+                    })?;
+            sha256_header_value.set_sensitive(true);
+            headers.insert(
+                "x-ms-encryption-key-sha256",
+                sha256_header_value,
+            );
+
+            self.client_options = self.client_options.with_default_headers(headers);
+        }
+
         let config = AzureConfig {
             account,
             is_emulator,
@@ -1202,10 +1270,12 @@ mod tests {
         let azure_client_id = "object_store:fake_access_key_id";
         let azure_storage_account_name = "object_store:fake_secret_key";
         let azure_storage_token = "object_store:fake_default_region";
+        let azure_encryption_key_base64 = "object_store:fake_encryption_key";
         let options = HashMap::from([
             ("azure_client_id", azure_client_id),
             ("azure_storage_account_name", azure_storage_account_name),
             ("azure_storage_token", azure_storage_token),
+            ("azure_encryption_key_base64", azure_encryption_key_base64),
         ]);
 
         let builder = options
@@ -1216,6 +1286,7 @@ mod tests {
         assert_eq!(builder.client_id.unwrap(), azure_client_id);
         assert_eq!(builder.account_name.unwrap(), azure_storage_account_name);
         assert_eq!(builder.bearer_token.unwrap(), azure_storage_token);
+        assert_eq!(builder.encryption_key_base64.unwrap(), azure_encryption_key_base64);
     }
 
     #[test]
